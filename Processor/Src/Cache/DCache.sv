@@ -112,14 +112,346 @@ function automatic DCacheNRUAccessStatePath DecideWayToEvictByNRUState( DCacheNR
     return (NRUState | NRUState + 1) ^ NRUState;
 endfunction
 
+// NRUStateArray + NRUStateWriteQueue
+// NRUStateArray receives up to 4 requests (2 reads + 2 writes) at a time,
+// while it is a true dual port RAM.
+// Read requests has priority to access the array.
+// Write requests are buffered in NRUStateWriteQueue and sent to the array when
+// valid read requests do not exist and ports are available.
+module NRUStateWriteQueue #(
+    parameter ENTRY_NUM = 16,
+    parameter ENTRY_BIT_SIZE = 1,
+    parameter PORT_NUM  = 2 // Do NOT change this parameter to synthesize True Dual Port RAM
+)(
+    input logic clk,
+    input logic rstStart,
+    input logic push[PORT_NUM],
+    input logic [ENTRY_BIT_SIZE-1: 0] pushedData[PORT_NUM],
+    input logic pop[PORT_NUM],
+    output logic [ENTRY_BIT_SIZE-1: 0]  poppedData[PORT_NUM],
+    output logic [ $clog2(ENTRY_NUM):0 ] count
+);
+
+    localparam INDEX_BIT_SIZE = $clog2(ENTRY_NUM);
+    typedef logic [INDEX_BIT_SIZE-1: 0] IndexPath;
+    typedef logic [ENTRY_BIT_SIZE-1: 0] Value;
+
+    // --- Queue pointer
+    IndexPath headPtr;
+    IndexPath tailPtr;
+    logic [ $clog2(PORT_NUM):0 ] pushCount;
+    logic [ $clog2(PORT_NUM):0 ] popCount;
+    
+    MultiWidthQueuePointer #(
+        .SIZE( ENTRY_NUM ),
+        .INITIAL_HEAD_PTR( 0 ), 
+        .INITIAL_TAIL_PTR( 0 ),
+        .INITIAL_COUNT( 0 ),
+        .PUSH_WIDTH( PORT_NUM ),
+        .POP_WIDTH( PORT_NUM )
+    ) queuePointer (
+        .clk( clk ),
+        .rst( rstStart ),
+        .push( pushCount != 0 ),
+        .pop( popCount != 0 ),
+        .pushCount( pushCount ),
+        .popCount( popCount ),
+        .headPtr( headPtr ),
+        .tailPtr( tailPtr ),
+        .count( count )
+    );
+
+    // --- Queue body
+    logic we[PORT_NUM];
+    Value wv[PORT_NUM];
+    IndexPath wa[PORT_NUM];
+
+    Value rv[PORT_NUM];
+    IndexPath ra[PORT_NUM];
+
+    DistributedMultiBankRAM #( 
+        .ENTRY_NUM( ENTRY_NUM ), 
+        .ENTRY_BIT_SIZE( ENTRY_BIT_SIZE ),
+        .READ_NUM( PORT_NUM ),
+        .WRITE_NUM( PORT_NUM )
+    ) queueBody (
+        .clk( clk ),
+        .wa( wa ),
+        .we( we ),
+        .wv( wv ),
+        .ra( ra ),
+        .rv( rv )
+    );
+
+    always_comb begin
+        //
+        // --- push
+        //
+        pushCount = 0;
+        for (int i = 0; i < PORT_NUM; i++) begin
+            if ((tailPtr + pushCount) >= ENTRY_NUM) begin
+                // Compensate the index to point in the queue
+                wa[i] = tailPtr + pushCount - ENTRY_NUM;
+            end
+            else begin
+                wa[i] = tailPtr + pushCount;
+            end
+            wv[i] = pushedData[i];
+            we[i] = push[i];
+            if (push[i]) begin
+                pushCount += 1;
+            end
+        end
+
+        //
+        // --- pop
+        //        
+        popCount = 0;
+        for (int i = 0; i < PORT_NUM; i++) begin
+            // "ra" is serialized for multi-banking.
+            if ((headPtr + i) >= ENTRY_NUM) begin
+                ra[i] = headPtr + i - ENTRY_NUM;
+            end
+            else begin
+                ra[i] = headPtr + i;
+            end
+            poppedData[i] = rv[i];
+            if (pop[i]) begin
+                popCount += 1;
+            end
+        end
+        
+        if (rstStart) begin
+            for (int i = 0; i < PORT_NUM; i++) begin
+                wa[i] = i;
+                wv[i] = '0;
+                we[i] = FALSE;
+            end
+        end
+    end
+
+    `RSD_ASSERT_CLK_FMT(
+        clk,
+        (ENTRY_NUM >= PORT_NUM),
+        ("# of entries (%x) must be more than # of ports (%x) .", ENTRY_NUM, PORT_NUM)
+    );
+
+    `RSD_ASSERT_CLK_FMT(
+        clk,
+        (count >= popCount),
+        ("popCount (%x) exceeds # of valid entries (%x) .", popCount, count)
+    );
+
+    `RSD_ASSERT_CLK_FMT(
+        clk,
+        ((count + pushCount) <= ENTRY_NUM),
+        ("Queue overflow detected: count (%x), pushCount (%x), ENTRY_NUM (%x).", 
+         count, pushCount, ENTRY_NUM)
+    );
+
+endmodule : NRUStateWriteQueue
+
+module NRUStateArray #( 
+    parameter ENTRY_NUM = 16, 
+    parameter ENTRY_BIT_SIZE = 1,
+    parameter PORT_NUM  = 2 // Do NOT change this parameter to synthesize True Dual Port RAM
+)( 
+    input logic clk,
+    input logic rstStart,
+    input logic we[PORT_NUM],
+    input logic [$clog2(ENTRY_NUM)-1: 0] wa[PORT_NUM],
+    input logic [ENTRY_BIT_SIZE-1: 0] wv[PORT_NUM],
+    input logic re[PORT_NUM],
+    input logic [$clog2(ENTRY_NUM)-1: 0] ra[PORT_NUM],
+    output logic [ENTRY_BIT_SIZE-1: 0] rv[PORT_NUM]
+);
+
+    localparam INDEX_BIT_SIZE = $clog2(ENTRY_NUM);
+    typedef logic [INDEX_BIT_SIZE-1: 0] Address;
+    typedef logic [ENTRY_BIT_SIZE-1: 0] Value;
+
+//
+// NRU state write queue
+//
+    logic writeQueuePush[PORT_NUM];
+    NruStateWriteQueueEntry writeQueuePushedData[PORT_NUM];
+    logic writeQueuePop[PORT_NUM];
+    NruStateWriteQueueEntry writeQueuePoppedData[PORT_NUM];
+    logic [ $clog2(NRU_STATE_WRITE_QUEUE_SIZE):0 ] writeQueueCount;
+    logic [ $clog2(NRU_STATE_WRITE_QUEUE_SIZE):0 ] pushCount;
+
+    // push
+    always_comb begin
+        pushCount = 0;
+        for (int i = 0; i < PORT_NUM; i++) begin
+            writeQueuePush[i] = we[i];
+            writeQueuePushedData[i].wa = wa[i];
+            writeQueuePushedData[i].wv = wv[i];
+            if (we[i]) begin
+                pushCount = pushCount + 1;
+            end
+        end
+    end
+
+    // pop signals are assigned later.
+
+    NRUStateWriteQueue #(
+        .ENTRY_NUM( NRU_STATE_WRITE_QUEUE_SIZE ),
+        .ENTRY_BIT_SIZE( $bits(NruStateWriteQueueEntry) ),
+        .PORT_NUM( PORT_NUM )
+    ) nruStateWriteQueue (
+        .clk(clk),
+        .rstStart(rstStart),
+        .push(writeQueuePush),
+        .pushedData(writeQueuePushedData),
+        .pop(writeQueuePop),
+        .poppedData(writeQueuePoppedData),
+        .count(writeQueueCount)
+    );
+
+//
+// NRU state array input MUX (reads have higher priority)
+// Pop signals of NRUStateWriteQueue is also assigned here.
+//
+    Address arrayRWA[PORT_NUM];
+    Value arrayWV[PORT_NUM];
+    logic arrayWE[PORT_NUM];
+
+    logic [ $clog2(NRU_STATE_WRITE_QUEUE_SIZE):0 ] writeCount;
+    logic writable;
+    logic [ $clog2(NRU_STATE_WRITE_QUEUE_SIZE):0 ] popCount;
+
+    always_comb begin
+        writeCount = 0;
+        writable = TRUE;
+        popCount = 0;
+        for (int i = 0; i < PORT_NUM; i++) begin
+            arrayRWA[i] = '0;
+            arrayWV[i] = '0;
+            arrayWE[i] = FALSE;
+            writeQueuePop[i] = FALSE;
+        end
+
+        for (int i = 0; i < PORT_NUM; i++) begin
+            if (re[i]) begin
+                // read requests have higher priority
+                arrayRWA[i] = ra[i];
+            end
+            else begin
+                // write requests
+                arrayRWA[i] = writeQueuePoppedData[writeCount].wa;
+                arrayWV[i] = writeQueuePoppedData[writeCount].wv;
+
+                // Write enable is set only when
+                // (1) write request is valid AND
+                // (2) all the preceding write requests' write enable is set AND
+                // (3) no write request writes to the same location (i.e., write conflict).
+                if (writeCount < writeQueueCount) begin // write request is valid
+                    if (writable) begin // all the preceding write reqiests can write
+                        arrayWE[i] = TRUE;
+                        writeQueuePop[writeCount] = TRUE;
+                        for (int j = 0; j < writeCount; j++) begin
+                            if (writeQueuePoppedData[j].wa 
+                                == writeQueuePoppedData[writeCount].wa)
+                            begin
+                                // Write conflict detected
+                                arrayWE[i] = FALSE;
+                                writeQueuePop[writeCount] = FALSE;
+                                
+                                // All the following write requests cannot write
+                                // in this cycle.
+                                writable = FALSE;
+                            end
+                        end
+                    end
+                end
+                writeCount = writeCount + 1;
+            end
+        end
+
+        // If writeQueue is full, the oldest requests are dropped.
+        // (i.e., we give up to write these requests.)
+        // This situation can occur when many nruStatus read requests come every cycle.
+        // This may degrade performance but we do for performance-area tradeoff; 
+        // otherwise complex structures such as a multi-port NRUStateArray are required.
+        if ((writeQueueCount + pushCount) > (NRU_STATE_WRITE_QUEUE_SIZE - PORT_NUM)) begin
+            popCount = (writeQueueCount + pushCount) - (NRU_STATE_WRITE_QUEUE_SIZE - PORT_NUM);
+            for (int i = 0; i < popCount; i++) begin
+                writeQueuePop[i] = TRUE;
+            end
+        end
+    end
+
+    `RSD_ASSERT_CLK_FMT(
+        clk,
+        (popCount <= PORT_NUM),
+        ("popCount (%x) must be less than PORT_NUM (%x).", popCount, PORT_NUM)
+    );
+
+//
+// NRU state array
+//
+`ifdef RSD_SYNTHESIS_OPT_MICROSEMI
+    Value array[ENTRY_NUM];   // synthesis syn_ramstyle = "lsram"
+`else
+    Value array[ENTRY_NUM];   // synthesis syn_ramstyle = "block_ram"
+`endif
+    
+`ifdef RSD_SYNTHESIS_DESIGN_COMPILER
+    // Design Compiler does not accept the statements for Synplify
+    always_ff @(posedge clk) begin
+        for (int i = 0; i < PORT_NUM; i++) begin
+            rv[i] <= array[ arrayRWA[i] ];
+            if(arrayWE[i]) 
+                array[ arrayRWA[i] ] <= arrayWV[i];
+        end
+    end
+`else
+    // These statements are for Synplify.
+    // The following circuit must be written in a *generate* clause.
+    // This is because Synplify generates a circuit that detects writing to the same address if *generate* clause is not used. 
+    // This circuit does not affect the operation, but a broken circuit is generated due to a bug of Synplify.
+    generate
+        for (genvar i = 0; i < PORT_NUM; i++) begin
+            always_ff @(posedge clk) begin
+                rv[i] <= array[ arrayRWA[i] ];
+                if(arrayWE[i]) 
+                    array[ arrayRWA[i] ] <= arrayWV[i];
+            end
+        end
+    endgenerate
+`endif
+
+    generate
+        for (genvar j = 0; j < PORT_NUM; j++) begin
+            for (genvar i = 0; i < PORT_NUM; i++) begin
+                `RSD_ASSERT_CLK_FMT(
+                    clk,
+                    !(arrayWE[i] && arrayWE[j] && arrayRWA[i] == arrayRWA[j] && i != j),
+                    ("Multiple ports(%x,%x) write to the same entry.", i, j)
+                );
+            end
+        end
+
+        for (genvar i = 0; i < PORT_NUM; i++) begin
+            `RSD_ASSERT_CLK_FMT(
+                clk,
+                !(arrayRWA[i] >= ENTRY_NUM),
+                ("Port (%x) read from or write to the outside of the RAM array.", i)
+            );
+        end
+    endgenerate
+
+endmodule : NRUStateArray
+
 module DCacheEvictWaySelector(DCacheIF.DCacheEvictWaySelector port);
 
     DCacheIndexPath rstIndex;
     logic we[DCACHE_ARRAY_PORT_NUM];
-    DCacheIndexPath          nruStateIndex[DCACHE_ARRAY_PORT_NUM];
+    logic re[DCACHE_ARRAY_PORT_NUM];
+    DCacheIndexPath          nruStateWriteIndex[DCACHE_ARRAY_PORT_NUM];
     DCacheNRUAccessStatePath nruStateDataIn[DCACHE_ARRAY_PORT_NUM];
     DCacheNRUAccessStatePath nruStateDataOut[DCACHE_ARRAY_PORT_NUM];
-    logic                    isSameNRUIndex[DCACHE_ARRAY_PORT_NUM];
     DCacheNRUAccessStatePath wayToEvictOneHot[DCACHE_ARRAY_PORT_NUM];
 
     logic           repIsHit[DCACHE_ARRAY_PORT_NUM];
@@ -128,19 +460,29 @@ module DCacheEvictWaySelector(DCacheIF.DCacheEvictWaySelector port);
     DCacheWayPath   repWayToEvict[DCACHE_ARRAY_PORT_NUM];
     DCacheIndexPath repReadIndex[DCACHE_ARRAY_PORT_NUM];
     DCacheIndexPath repWriteIndex[DCACHE_ARRAY_PORT_NUM];
-    logic           repIsMSHR[DCACHE_ARRAY_PORT_NUM];
+    logic           repNruRE[DCACHE_ARRAY_PORT_NUM];
+    logic           repIsMSHRVictim[DCACHE_ARRAY_PORT_NUM];
     logic           repIsLSU[DCACHE_ARRAY_PORT_NUM];
     logic           repUpdateReq[DCACHE_ARRAY_PORT_NUM];
 
-    // NRUStateArray array
-    BlockTrueDualPortRAM #(
+    // NRU state array:
+    // Up to 4 requests (2 reads + 2 writes) are sent to this array
+    // while it is a true dual port RAM.
+    // Read requests have higher priority.
+    // Read requests always receive the corresponding data next cycle.
+    // Write requests are buffered in queue and processed when
+    // a port of the array is available.
+    NRUStateArray #(
         .ENTRY_NUM( DCACHE_INDEX_NUM ),
         .ENTRY_BIT_SIZE( $bits( DCacheNRUAccessStatePath ) )
     ) nruStateArray (
         .clk( port.clk ),
+        .rstStart( port.rstStart ),
         .we( we ),
-        .rwa( nruStateIndex ),
+        .wa( nruStateWriteIndex ),
         .wv( nruStateDataIn ),
+        .re( re ),
+        .ra( repReadIndex ),
         .rv( nruStateDataOut )
     );
 
@@ -148,11 +490,11 @@ module DCacheEvictWaySelector(DCacheIF.DCacheEvictWaySelector port);
         // Initialize.
         for (int p = 0; p < DCACHE_ARRAY_PORT_NUM; p++) begin
             we[p]               = FALSE;
-            nruStateIndex[p]    = '0;
+            re[p]               = FALSE;
+            nruStateWriteIndex[p]    = '0;
             nruStateDataIn[p]   = '0;
             repWayToEvict[p]    = '0;
             wayToEvictOneHot[p] = '0;
-            isSameNRUIndex[p]   = FALSE;
         end
 
         // Inputs.
@@ -161,14 +503,15 @@ module DCacheEvictWaySelector(DCacheIF.DCacheEvictWaySelector port);
         repEvictWay   = port.repEvictWay;
         repReadIndex  = port.repReadIndex;
         repWriteIndex = port.repWriteIndex;
-        repIsMSHR     = port.repIsMSHR;
+        repNruRE      = port.repNruRE;
+        repIsMSHRVictim     = port.repIsMSHRVictim;
         repIsLSU      = port.repIsLSU;
         repUpdateReq  = port.repUpdateReq;
 
         if (port.rst) begin
             // Port 0 is used for reset.
             we[0] = TRUE;
-            nruStateIndex[0] = rstIndex;
+            nruStateWriteIndex[0] = rstIndex;
             nruStateDataIn[0] = '0;
         end
         else begin
@@ -176,31 +519,19 @@ module DCacheEvictWaySelector(DCacheIF.DCacheEvictWaySelector port);
             for (int p = 0; p < DCACHE_ARRAY_PORT_NUM; p++) begin
                 wayToEvictOneHot[p] = DecideWayToEvictByNRUState(nruStateDataOut[p]);
 
-                // Detects when two ports of NRU are being accessed
-                // at the same time with the same index.
-                // This can happen when accessing from the LSU.
-                for (int q = 0; q < p; q++) begin
-                    if (repWriteIndex[p] == repWriteIndex[q]) begin
-                        isSameNRUIndex[p] = TRUE;
-                        break;
-                    end
-                end
-
                 // If tag hits and lsu is doing that access, update NRU state.
-                // If MSHR is doing that accsss, update NRU state.
-                if (repIsMSHR[p] && repUpdateReq[p]) begin
+                // If MSHR victim is doing that accsss, update NRU state.
+                if (repIsMSHRVictim[p] && repUpdateReq[p]) begin
                     we[p] = TRUE;
-                    nruStateIndex[p] = repWriteIndex[p]; // Index used for reading one cycle ago
+                    nruStateWriteIndex[p] = repWriteIndex[p]; // Index used for reading one cycle ago
                     nruStateDataIn[p] = UpdateNRUState(nruStateDataOut[p], repEvictWay[p]);
                 end else if (repIsLSU[p] && repIsHit[p] && repUpdateReq[p]) begin
                     we[p] = TRUE;
-                    nruStateIndex[p] = repWriteIndex[p]; // Index used for reading one cycle ago
+                    nruStateWriteIndex[p] = repWriteIndex[p]; // Index used for reading one cycle ago
                     nruStateDataIn[p] = UpdateNRUState(nruStateDataOut[p], repHitWay[p]);
-                end else begin
-                    we[p] = FALSE;
-                    nruStateIndex[p] = repReadIndex[p];  // NRU read index
-                    nruStateDataIn[p] = '0;
                 end
+
+                re[p] = repNruRE[p];
 
                 // Select evict way
                 for (int way = 0; way < DCACHE_WAY_NUM; way++) begin
@@ -315,6 +646,7 @@ module DCacheArrayPortArbiter(DCacheIF.DCacheArrayPortArbiter port);
     logic grant[DCACHE_MUX_PORT_NUM];
     DCacheMuxPortIndexPath cacheArrayInSel[DCACHE_ARRAY_PORT_NUM];
     DCacheArrayPortIndex   cacheArrayOutSel[DCACHE_MUX_PORT_NUM];
+    logic                  cacheArrayInGrant[DCACHE_ARRAY_PORT_NUM];
     logic                  cacheArrayGrant[DCACHE_MUX_PORT_NUM];
 
     always_comb begin
@@ -336,12 +668,14 @@ module DCacheArrayPortArbiter(DCacheIF.DCacheArrayPortArbiter port);
         // Arbitrate
         for (int p = 0; p < DCACHE_ARRAY_PORT_NUM; p++ ) begin
             cacheArrayInSel[p] = '0;
+            cacheArrayInGrant[p] = FALSE;
             for (int r = 0; r < DCACHE_MUX_PORT_NUM; r++) begin
                 if (req[r]) begin
                     req[r] = FALSE;
                     grant[r] = TRUE;
                     cacheArrayInSel[p] = r;
                     cacheArrayOutSel[r] = p;
+                    cacheArrayInGrant[p] = TRUE;
                     cacheArrayGrant[r] = TRUE;
                     break;
                 end
@@ -351,6 +685,7 @@ module DCacheArrayPortArbiter(DCacheIF.DCacheArrayPortArbiter port);
         // Outputs
         port.cacheArrayInSel = cacheArrayInSel;
         port.cacheArrayOutSel = cacheArrayOutSel;
+        port.cacheArrayInGrant = cacheArrayInGrant;
         port.cacheArrayGrant = cacheArrayGrant;
 
         for (int r = 0; r < DCACHE_LSU_PORT_NUM; r++) begin
@@ -385,6 +720,9 @@ module DCacheArrayPortMultiplexer(DCacheIF.DCacheArrayPortMultiplexer port);
     DCachePortMultiplexerIn muxIn[DCACHE_MUX_PORT_NUM];
     DCachePortMultiplexerIn muxInReg[DCACHE_ARRAY_PORT_NUM];    // DCACHE_ARRAY_PORT_NUM!
 
+    logic                cacheArrayInGrant[DCACHE_ARRAY_PORT_NUM];
+    logic                cacheArrayInGrantRegTagStg[DCACHE_ARRAY_PORT_NUM];
+
     DCachePortMultiplexerTagOut muxTagOut[DCACHE_MUX_PORT_NUM];
     DCachePortMultiplexerDataOut muxDataOut[DCACHE_MUX_PORT_NUM];
 
@@ -415,7 +753,8 @@ module DCacheArrayPortMultiplexer(DCacheIF.DCacheArrayPortMultiplexer port);
     DCacheWayPath   repWayToEvict[DCACHE_ARRAY_PORT_NUM];
     DCacheIndexPath repReadIndex[DCACHE_ARRAY_PORT_NUM];
     DCacheIndexPath repWriteIndex[DCACHE_ARRAY_PORT_NUM];
-    logic           repIsMSHR[DCACHE_ARRAY_PORT_NUM];
+    logic           repNruRE[DCACHE_ARRAY_PORT_NUM];
+    logic           repIsMSHRVictim[DCACHE_ARRAY_PORT_NUM];
     logic           repIsLSU[DCACHE_ARRAY_PORT_NUM];
     logic           repUpdateReq[DCACHE_ARRAY_PORT_NUM];
 
@@ -426,10 +765,12 @@ module DCacheArrayPortMultiplexer(DCacheIF.DCacheArrayPortMultiplexer port);
             if (port.rst) begin
                 portInRegTagStg[i] <= '0;
                 muxInReg[i] <= '0;
+                cacheArrayInGrantRegTagStg[i] <= '0;
             end
             else begin
                 portInRegTagStg[i] <= port.cacheArrayInSel[i];
                 muxInReg[i] <= muxIn[ port.cacheArrayInSel[i] ];
+                cacheArrayInGrantRegTagStg[i] <= cacheArrayInGrant[i];
             end
 
         end
@@ -473,6 +814,9 @@ module DCacheArrayPortMultiplexer(DCacheIF.DCacheArrayPortMultiplexer port);
             portMSHRData[r] = port.mshrData[r];
         end
 
+        for (int r = 0; r < DCACHE_ARRAY_PORT_NUM; r++) begin
+            cacheArrayInGrant[r] = port.cacheArrayInGrant[r];
+        end
 
         //
         // stage:   | ADDR   | D$TAG    | D$DATA   |
@@ -510,6 +854,7 @@ module DCacheArrayPortMultiplexer(DCacheIF.DCacheArrayPortMultiplexer port);
         for (int p = 0; p < DCACHE_ARRAY_PORT_NUM; p++) begin
             portIn = port.cacheArrayInSel[p];
             repReadIndex[p] = muxIn[portIn].indexIn; // NRU read index
+            repNruRE[p] = muxIn[portIn].nruRE & cacheArrayInGrant[p];
         end
 
 
@@ -621,9 +966,9 @@ module DCacheArrayPortMultiplexer(DCacheIF.DCacheArrayPortMultiplexer port);
         // NRU access
         for (int p = 0; p < DCACHE_ARRAY_PORT_NUM; p++) begin
             repWriteIndex[p] = muxInReg[p].indexIn; // NRU write index
-            repIsMSHR[p]     = muxInReg[p].isMSHR;
+            repIsMSHRVictim[p]     = muxInReg[p].isMSHRVictim;
             repIsLSU[p]      = muxInReg[p].isLSU;
-            repUpdateReq[p]  = portGrantTagStg[ portInRegTagStg[p] ];
+            repUpdateReq[p]  = cacheArrayInGrantRegTagStg[p];
         end
 
         // Outputs
@@ -632,7 +977,8 @@ module DCacheArrayPortMultiplexer(DCacheIF.DCacheArrayPortMultiplexer port);
         port.repEvictWay   = repWayToEvict;
         port.repReadIndex  = repReadIndex;
         port.repWriteIndex = repWriteIndex;
-        port.repIsMSHR     = repIsMSHR;
+        port.repNruRE      = repNruRE;
+        port.repIsMSHRVictim     = repIsMSHRVictim;
         port.repIsLSU      = repIsLSU;
         port.repUpdateReq  = repUpdateReq;
 
@@ -973,6 +1319,7 @@ module DCache(
         for (int i = 0; i < DCACHE_LSU_READ_PORT_NUM; i++) begin
 
             port.lsuCacheReq[(i+DCACHE_LSU_READ_PORT_BEGIN)] = lsu.dcReadReq[i];
+            port.lsuMuxIn[(i+DCACHE_LSU_READ_PORT_BEGIN)].nruRE = lsu.dcReadReq[i];
             port.lsuMuxIn[(i+DCACHE_LSU_READ_PORT_BEGIN)].tagWE = FALSE;
             port.lsuMuxIn[(i+DCACHE_LSU_READ_PORT_BEGIN)].indexIn = ToIndexPartFromFullAddr(lsu.dcReadAddr[i]);
             port.lsuMuxIn[(i+DCACHE_LSU_READ_PORT_BEGIN)].tagDataIn = ToTagPartFromFullAddr(lsu.dcReadAddr[i]);
@@ -984,7 +1331,7 @@ module DCache(
             port.lsuMuxIn[(i+DCACHE_LSU_READ_PORT_BEGIN)].dataDirtyIn = FALSE;
             port.lsuMuxIn[(i+DCACHE_LSU_READ_PORT_BEGIN)].makeMSHRCanBeInvalid = lsuMakeMSHRCanBeInvalid[i];
             port.lsuMuxIn[(i+DCACHE_LSU_READ_PORT_BEGIN)].evictWay = '0;
-            port.lsuMuxIn[(i+DCACHE_LSU_READ_PORT_BEGIN)].isMSHR = FALSE;
+            port.lsuMuxIn[(i+DCACHE_LSU_READ_PORT_BEGIN)].isMSHRVictim = FALSE;
             port.lsuMuxIn[(i+DCACHE_LSU_READ_PORT_BEGIN)].isLSU  = TRUE;
         end
 
@@ -1027,6 +1374,7 @@ module DCache(
             storedLineByteWE = lsu.dcWriteByteWE;
 
             port.lsuCacheReq[(i+DCACHE_LSU_WRITE_PORT_BEGIN)] = lsu.dcWriteReq;
+            port.lsuMuxIn[(i+DCACHE_LSU_WRITE_PORT_BEGIN)].nruRE = lsu.dcWriteReq;
             port.lsuMuxIn[(i+DCACHE_LSU_WRITE_PORT_BEGIN)].tagWE = FALSE;    // First, stores read tag.
             port.lsuMuxIn[(i+DCACHE_LSU_WRITE_PORT_BEGIN)].indexIn = ToIndexPartFromFullAddr(lsu.dcWriteAddr);
             port.lsuMuxIn[(i+DCACHE_LSU_WRITE_PORT_BEGIN)].tagDataIn = ToTagPartFromFullAddr(lsu.dcWriteAddr);
@@ -1039,7 +1387,7 @@ module DCache(
             // ストアはコミット時に初めて MSHR にアクセスするので，キャンセルはしないはず？
             port.lsuMuxIn[(i+DCACHE_LSU_WRITE_PORT_BEGIN)].makeMSHRCanBeInvalid = FALSE;//lsuMakeMSHRCanBeInvalid[(i+DCACHE_LSU_WRITE_PORT_BEGIN)];
             port.lsuMuxIn[(i+DCACHE_LSU_WRITE_PORT_BEGIN)].evictWay = '0;
-            port.lsuMuxIn[(i+DCACHE_LSU_WRITE_PORT_BEGIN)].isMSHR = FALSE;
+            port.lsuMuxIn[(i+DCACHE_LSU_WRITE_PORT_BEGIN)].isMSHRVictim = FALSE;
             port.lsuMuxIn[(i+DCACHE_LSU_WRITE_PORT_BEGIN)].isLSU  = TRUE;
 
             lsu.dcWriteReqAck = port.lsuCacheGrt[(i+DCACHE_LSU_WRITE_PORT_BEGIN)];
@@ -1336,13 +1684,14 @@ module DCacheMissHandler(
 
             // Other cache request signals.
             port.mshrCacheReq[i] = FALSE;
+            port.mshrCacheMuxIn[i].nruRE = FALSE;
             port.mshrCacheMuxIn[i].tagWE = FALSE;
             port.mshrCacheMuxIn[i].dataWE = FALSE;
             port.mshrCacheMuxIn[i].dataWE_OnTagHit = FALSE;
             port.mshrCacheMuxIn[i].dataDirtyIn = FALSE;
             port.mshrCacheMuxIn[i].makeMSHRCanBeInvalid = FALSE;
             port.mshrCacheMuxIn[i].evictWay = mshr[i].evictWay;
-            port.mshrCacheMuxIn[i].isMSHR = FALSE;
+            port.mshrCacheMuxIn[i].isMSHRVictim = FALSE;
             port.mshrCacheMuxIn[i].isLSU = FALSE;
 
             // Memory request signals
@@ -1406,11 +1755,12 @@ module DCacheMissHandler(
                 MSHR_PHASE_VICTIM_REQEUST: begin
                     // Access the cache array.
                     port.mshrCacheReq[i] = TRUE;
+                    port.mshrCacheMuxIn[i].nruRE = TRUE;
                     port.mshrCacheMuxIn[i].tagWE = FALSE;
                     port.mshrCacheMuxIn[i].dataWE = FALSE;
                     port.mshrCacheMuxIn[i].dataWE_OnTagHit = FALSE;
                     port.mshrCacheMuxIn[i].dataDirtyIn = FALSE;
-                    port.mshrCacheMuxIn[i].isMSHR = TRUE;
+                    port.mshrCacheMuxIn[i].isMSHRVictim = TRUE;
 
                     nextMSHR[i].phase =
                         port.mshrCacheGrt[i] ?
@@ -1604,6 +1954,7 @@ module DCacheMissHandler(
                 MSHR_PHASE_MISS_WRITE_CACHE_REQUEST: begin
                     // Fill the cache array.
                     port.mshrCacheReq[i] = TRUE;
+                    port.mshrCacheMuxIn[i].nruRE = FALSE;
                     port.mshrCacheMuxIn[i].tagWE = TRUE;
                     port.mshrCacheMuxIn[i].dataWE = TRUE;
                     port.mshrCacheMuxIn[i].dataWE_OnTagHit = FALSE;

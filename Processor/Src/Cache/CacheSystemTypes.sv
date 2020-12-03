@@ -15,7 +15,7 @@ package CacheSystemTypes;
     // Main cache parameters.
     // The remaining cache parameters must be fixed or calculated by the following
     // parameters.
-    localparam DCACHE_WAY_NUM = 2;           // Way Num
+	localparam DCACHE_WAY_NUM = 2;           // Way Num
     localparam DCACHE_INDEX_BIT_WIDTH = 9 - $clog2(DCACHE_WAY_NUM);   // The number of index bits
     localparam DCACHE_LINE_BYTE_NUM = 8;    // Line size
     localparam MSHR_NUM = 2;                 // The nubmer of MSHR entries.
@@ -53,11 +53,15 @@ package CacheSystemTypes;
     localparam DCACHE_WAY_BIT_NUM = (DCACHE_WAY_NUM != 1) ? $clog2(DCACHE_WAY_NUM)-1 : 0;
     typedef logic [DCACHE_WAY_BIT_NUM:0] DCacheWayPath;
 
+
+    // NRU State Array
     // NRU Access state bits
     // (N-way NRU -> N bits)
     // These bits correspond to the cache way:
     //   if bit[way] == 1 then the way is referenced recently
     typedef logic [DCACHE_WAY_NUM-1:0] DCacheNRUAccessStatePath;
+    // Maximum number of nruState write requests buffered
+    localparam NRU_STATE_WRITE_QUEUE_SIZE = 8;
 
     // Subset of index for MSHR identifier in ReplayQueue
     // This value MUST be less than or equal to DCACHE_INDEX_BIT_WIDTH.
@@ -149,6 +153,9 @@ package CacheSystemTypes;
     {
         DCacheIndexPath indexIn;
 
+        // NRU state is read by loads, stores, and MSHR victims.
+        logic           nruRE;
+
         logic           tagWE;
         DCacheTagPath   tagDataIn;
         logic           tagValidIn;
@@ -165,10 +172,13 @@ package CacheSystemTypes;
         // To notify DCache which way will be evicted.
         DCacheWayPath   evictWay;
 
-        // If true, it tells DCache that MSHR or LSU is doing the access.
-        // Update the data structure used for data replacement when accessing from lsu and MSHR.
-        logic           isMSHR;
+        // The following bits indicate a type of DCache requests.
+        // DCache requests are classified into three types:
+        // (1) read/write request of a load/store from MemExecPipe/StoreCommitter (isLSU=1),
+        // (2) read request of victim cache line from MSHR (isMSHRVictim=1),
+        // (3) write request of filled cache line from MSHR (isLSU=isMSHRVictim=0).
         logic           isLSU;
+        logic           isMSHRVictim;
     } DCachePortMultiplexerIn;
 
     typedef struct packed   // DCachePortMultiplexerTagOut
@@ -205,6 +215,11 @@ package CacheSystemTypes;
         MemWriteSerial wserial; // Request serial
     } MemoryPortMultiplexerOut;
 
+    typedef struct packed // Entry of the queue to buffer write requests for NRUStateArray
+    {
+        DCacheIndexPath wa;            // Write Address
+        DCacheNRUAccessStatePath wv;   // NRU state to be updated
+    } NruStateWriteQueueEntry;
 
     // ports
     // Read: for load[LOAD_ISSUE_WIDTH], for store(commit), read victim[MSHR_NUM]
